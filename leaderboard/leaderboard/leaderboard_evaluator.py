@@ -33,10 +33,7 @@ from leaderboard.envs.sensor_interface import SensorConfigurationInvalid
 from leaderboard.autoagents.agent_wrapper import AgentError, validate_sensor_configuration, TickRuntimeError
 from leaderboard.utils.statistics_manager import StatisticsManager, FAILURE_MESSAGES
 from leaderboard.utils.route_indexer import RouteIndexer
-import atexit
-import subprocess
 import time
-import random
 from datetime import datetime
 
 sensors_to_icons = {
@@ -49,21 +46,9 @@ sensors_to_icons = {
     'sensor.speedometer':       'carla_speedometer'
 }
 
-import socket
-
-def find_free_port(starting_port):
-    port = starting_port
-    while True:
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.bind(("localhost", port))
-                return port
-        except OSError:
-            port += 1
-
 def get_weather_id(weather_conditions):
     from xml.etree import ElementTree as ET
-    tree = ET.parse('leaderboard/data/weather.xml')
+    tree = ET.parse('3rd_party/Bench2Drive/leaderboard/data/weather.xml')
     root = tree.getroot()
     def conditions_match(weather, conditions):
         for (key, value) in weather:
@@ -198,16 +183,9 @@ class LeaderboardEvaluator(object):
         """
         Prepares the simulation by getting the client, and setting up the world and traffic manager settings
         """
-        self.carla_path = os.environ["CARLA_ROOT"]
-        args.port = find_free_port(args.port)
-        cmd1 = f"{os.path.join(self.carla_path, 'CarlaUE4.sh')} -RenderOffScreen -nosound -carla-rpc-port={args.port} -graphicsadapter={args.gpu_rank}"
-        self.server = subprocess.Popen(cmd1, shell=True, preexec_fn=os.setsid)
-        print(cmd1, self.server.returncode, flush=True)
-        atexit.register(os.killpg, self.server.pid, signal.SIGKILL)
-        time.sleep(30)
-            
         attempts = 0
-        num_max_restarts = 20
+        num_max_restarts = 1
+        client_setup_success = False
         while attempts < num_max_restarts:
             try:
                 client = carla.Client(args.host, args.port)
@@ -223,27 +201,34 @@ class LeaderboardEvaluator(object):
                 )
                 client.get_world().apply_settings(settings)
                 print(f"load_world success , attempts={attempts}", flush=True)
+                client_setup_success = True
                 break
             except Exception as e:
                 print(f"load_world failed , attempts={attempts}", flush=True)
                 print(e, flush=True)
                 attempts += 1
                 time.sleep(5)
+        if not client_setup_success:
+            raise RuntimeError("Failed to connect to CARLA server after {} attempts".format(num_max_restarts))
         attempts = 0
-        num_max_restarts = 40
+        num_max_restarts = 1
+        traffic_manager_setup_success = False
         while attempts < num_max_restarts:
             try:
-                args.traffic_manager_port = find_free_port(args.traffic_manager_port)
+                # args.traffic_manager_port = find_free_port(args.traffic_manager_port)
                 traffic_manager = client.get_trafficmanager(args.traffic_manager_port)
                 traffic_manager.set_synchronous_mode(True)
                 traffic_manager.set_hybrid_physics_mode(True)
                 print(f"traffic_manager init success, try_time={attempts}", flush=True)
+                traffic_manager_setup_success = True
                 break
             except Exception as e:
                 print(f"traffic_manager init fail, try_time={attempts}", flush=True)
                 print(e, flush=True)
                 attempts += 1
                 time.sleep(5)
+        if not traffic_manager_setup_success:
+            raise RuntimeError("Failed to connect to CARLA Traffic Manager after {} attempts".format(num_max_restarts))
         return client, client_timeout, traffic_manager
 
     def _reset_world_settings(self):
@@ -269,14 +254,25 @@ class LeaderboardEvaluator(object):
         """
         Load a new CARLA world without changing the settings and provide data to CarlaDataProvider
         """
-        self.world = self.client.load_world(town, reset_settings=False)
 
+        print("\033[1m> Loading the world\033[0m", flush=True)
+        t1 = time.time()
+        current_map = self.client.get_world().get_map().name.split("/")[-1]
+        if current_map != town:
+            self.world = self.client.load_world(town, reset_settings=False)
+        else:
+            self.world = self.client.get_world()
+        print(f"\033[1m>  Load_world time={time.time()-t1}", flush=True)
+
+        t2 = time.time()
         # Large Map settings are always reset, for some reason
         settings = self.world.get_settings()
         settings.tile_stream_distance = 650
         settings.actor_active_distance = 650
         self.world.apply_settings(settings)
+        print(f"\033[1m> Apply settings time={time.time()-t2}", flush=True)
 
+        t3 = time.time()
         self.world.reset_all_traffic_lights()
         CarlaDataProvider.set_client(self.client)
         CarlaDataProvider.set_traffic_manager_port(args.traffic_manager_port)
@@ -284,6 +280,7 @@ class LeaderboardEvaluator(object):
 
         # This must be here so that all route repetitions use the same 'unmodified' seed
         self.traffic_manager.set_random_device_seed(args.traffic_manager_seed)
+        print(f"\033[1m> Reset all traffic lights time={time.time()-t3}", flush=True)
 
         # Wait for the world to be ready
         self.world.tick()
@@ -325,8 +322,6 @@ class LeaderboardEvaluator(object):
         save_name = f"{route_name}_{town_name}_{scenario_name}_{weather_id}_{currentTime}"
         self.statistics_manager.create_route_data(route_name, scenario_name, weather_id, save_name, town_name, config.index)
 
-        print("\033[1m> Loading the world\033[0m", flush=True)
-
         # Load the world and the scenario
         try:
             self._load_and_wait_for_world(args, config.town)
@@ -342,10 +337,8 @@ class LeaderboardEvaluator(object):
             self._register_statistics(config.index, entry_status, crash_message)
             self._cleanup()
             return True
-
-        print("\033[1m> Setting up the agent\033[0m", flush=True)
-
         # Set up the user's agent, and the timer to avoid freezing the simulation
+        time_setup_agent = time.time()
         try:
             self._agent_watchdog = Watchdog(args.timeout)
             self._agent_watchdog.start()
@@ -400,6 +393,9 @@ class LeaderboardEvaluator(object):
             self._cleanup()
             return True
 
+        finally:
+            print(f"\033[1m> Agent setup time={time.time()-time_setup_agent:.2f}s\033[0m", flush=True)
+
         print("\033[1m> Running the route\033[0m", flush=True)
 
         # Run the scenario
@@ -420,10 +416,10 @@ class LeaderboardEvaluator(object):
 
         except KeyboardInterrupt:
             return True
-        
+
         except TickRuntimeError:
             entry_status, crash_message = "Started", "TickRuntime"
-        
+
         except Exception:
             print("\n\033[91mError during the simulation:", flush=True)
             print(f"\n{traceback.format_exc()}\033[0m", flush=True)
@@ -488,7 +484,7 @@ class LeaderboardEvaluator(object):
             self._ros1_server.shutdown()
 
         # Go back to asynchronous mode
-        self._reset_world_settings()
+        # self._reset_world_settings()
 
         if not crashed:
             # Save global statistics
@@ -496,11 +492,9 @@ class LeaderboardEvaluator(object):
             print("\033[1m> Registering the global statistics\033[0m", flush=True)
             self.statistics_manager.compute_global_statistics()
             self.statistics_manager.validate_and_write_statistics(self.sensors_initialized, crashed)
-        
+
         if crashed:
-            cmd2 = "ps -ef | grep '-graphicsadapter="+ str(args.gpu_rank) + "' | grep -v grep | awk '{print $2}' | xargs -r kill -9"
-            server = subprocess.Popen(cmd2, shell=True, preexec_fn=os.setsid)
-            atexit.register(os.killpg, server.pid, signal.SIGKILL)
+            pass
 
         return crashed
 
